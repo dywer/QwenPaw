@@ -2084,10 +2084,116 @@ class MatrixChannel(BaseChannel):
 
         content_parts: list[Any] = []
 
+        # Fetch and prepend replied message content if this is a reply
+        replied_event_id = self._extract_reply_to_event_id(event)
+        if replied_event_id:
+            replied_content = await self._fetch_event_content(
+                room_id,
+                replied_event_id,
+            )
+            if replied_content:
+                reply_sender = replied_content.get("sender", "")
+                reply_sender_name = self._get_display_name(room, reply_sender)
+                reply_body = replied_content.get("body", "")
+                reply_msgtype = replied_content.get("msgtype", "")
+                
+                # Add quoted context text
+                if reply_body:
+                    content_parts.append(
+                        TextContent(
+                            type=ContentType.TEXT,
+                            text=f"[Replying to {reply_sender_name}: {reply_body}]",
+                        ),
+                    )
+                
+                # If replied message is an image and vision is enabled, download it
+                if reply_msgtype == "m.image" and self.vision_enabled:
+                    replied_mxc_url = replied_content.get("url", "")
+                    replied_info = replied_content.get("info", {}) or {}
+                    replied_mimetype = replied_info.get("mimetype", "")
+                    replied_key = replied_content.get("key", {}) or {}
+                    replied_hashes = replied_content.get("hashes", {}) or {}
+                    replied_iv = replied_content.get("iv", "")
+                    
+                    if replied_mxc_url:
+                        # Generate filename for replied image
+                        replied_eid = replied_event_id[:8].lstrip("$")
+                        replied_filename = f"{replied_eid}_replied_image"
+                        
+                        # Add extension from mimetype
+                        if replied_mimetype and "." not in replied_filename:
+                            ext = mimetypes.guess_extension(replied_mimetype)
+                            if ext:
+                                replied_filename = f"{replied_filename}{ext}"
+                        
+                        # Download encrypted or unencrypted based on key presence
+                        if replied_key and replied_iv:
+                            replied_local_path = await self._download_encrypted_mxc(
+                                replied_mxc_url,
+                                replied_filename,
+                                replied_key,
+                                replied_hashes,
+                                replied_iv,
+                            )
+                        else:
+                            replied_local_path = await self._download_mxc(
+                                replied_mxc_url,
+                                replied_filename,
+                            )
+                        
+                        if replied_local_path:
+                            content_parts.append(
+                                ImageContent(
+                                    type=ContentType.IMAGE,
+                                    image_url=Path(replied_local_path).as_uri(),
+                                ),
+                            )
+                            logger.debug(
+                                "MatrixChannel: added replied encrypted image %s "
+                                "for event %s",
+                                replied_local_path,
+                                replied_event_id,
+                            )
+                
+                logger.debug(
+                    "MatrixChannel: prepended reply context for encrypted "
+                    "media event %s",
+                    replied_event_id,
+                )
+
+        # Get event metadata for better context
+        event_info = getattr(event, "info", {}) or {}
+        mimetype = event_info.get("mimetype", "")
+        size = event_info.get("size", 0)
+
         if mxc_url and key and iv:
+            # Generate clean filename: {event_id}_{type}.{ext}
             eid = event.event_id[:8].lstrip("$")
-            filename = body or f"matrix_media_{eid}"
-            filename = f"{eid}_{filename}"
+
+            # Determine file type prefix based on event type
+            if isinstance(event, RoomEncryptedImage):
+                type_prefix = "image"
+            elif isinstance(event, RoomEncryptedAudio):
+                type_prefix = "audio"
+            elif isinstance(event, RoomEncryptedVideo):
+                type_prefix = "video"
+            else:
+                type_prefix = "file"
+
+            filename = f"{eid}_{type_prefix}"
+
+            # Ensure file extension from MIME type for multimodal model compatibility
+            if mimetype and "." not in filename:
+                ext = mimetypes.guess_extension(mimetype)
+                if ext:
+                    filename = f"{filename}{ext}"
+                    logger.debug(
+                        "MatrixChannel: added extension %s from mimetype %s "
+                        "(encrypted)",
+                        ext,
+                        mimetype,
+                    )
+
             local_path = await self._download_encrypted_mxc(
                 mxc_url,
                 filename,
@@ -2097,6 +2203,21 @@ class MatrixChannel(BaseChannel):
             )
             if local_path:
                 file_uri = Path(local_path).as_uri()
+
+                # Add metadata text with original body/caption
+                meta_text = f"[User sent encrypted {type_prefix}"
+                if body:
+                    meta_text += f': "{body}"'
+                meta_text += f" | id:{event.event_id}"
+                if mimetype:
+                    meta_text += f" | mime:{mimetype}"
+                if size:
+                    meta_text += f" | size:{size}"
+                meta_text += "]"
+                content_parts.append(
+                    TextContent(type=ContentType.TEXT, text=meta_text),
+                )
+
                 if isinstance(event, RoomEncryptedImage):
                     if self.vision_enabled:
                         content_parts.append(
@@ -2142,9 +2263,17 @@ class MatrixChannel(BaseChannel):
                 content_parts.append(
                     TextContent(
                         type=ContentType.TEXT,
-                        text=f"[Encrypted media unavailable: {body}]",
+                        text=f"[Encrypted media download failed: {body or type_prefix}]",
                     ),
                 )
+        else:
+            # No mxc_url/key/iv, but still notify agent that media was sent
+            content_parts.append(
+                TextContent(
+                    type=ContentType.TEXT,
+                    text=f"[User sent an encrypted media message: {body or 'unnamed file'}]",
+                ),
+            )
 
         if not content_parts:
             return
@@ -2172,6 +2301,7 @@ class MatrixChannel(BaseChannel):
             )
 
         worker_name = (self._user_id or "").split(":")[0].lstrip("@")
+        replied_event_id_meta = self._extract_reply_to_event_id(event)
         payload = {
             "channel_id": CHANNEL_KEY,
             "sender_id": sender_id,
@@ -2184,6 +2314,7 @@ class MatrixChannel(BaseChannel):
                 "worker_name": worker_name,
                 "event_id": event.event_id,
                 "sender_id": sender_id,
+                "replied_to_event_id": replied_event_id_meta,
             },
         }
 
@@ -2358,6 +2489,122 @@ class MatrixChannel(BaseChannel):
     # (§9).
     # ------------------------------------------------------------------
 
+    def _extract_reply_to_event_id(self, event: Any) -> Optional[str]:
+        """Extract replied event ID from m.relates_to if present.
+
+        Returns the event_id of the message being replied to.
+        """
+        # Try multiple sources for m.relates_to (matrix-nio structure varies)
+        relates_to = None
+
+        # Source 1: event.source.content (raw event dict)
+        source = getattr(event, "source", {}) or {}
+        content = source.get("content", {}) or {}
+        relates_to = content.get("m.relates_to") or {}
+
+        # Source 2: directly from event (some versions store it here)
+        if not relates_to:
+            relates_to = getattr(event, "m_relates_to", {}) or {}
+
+        # Source 3: from event.content (alternative attribute)
+        if not relates_to:
+            event_content = getattr(event, "content", {}) or {}
+            if isinstance(event_content, dict):
+                relates_to = event_content.get("m.relates_to", {}) or {}
+
+        # Debug: log the full structure for reply detection
+        logger.info(
+            "MatrixChannel: reply detection - event_id=%s, "
+            "source_type=%s, relates_to=%s",
+            getattr(event, "event_id", "unknown"),
+            type(source).__name__,
+            relates_to if relates_to else "N/A",
+        )
+
+        if not relates_to:
+            logger.info("MatrixChannel: no m.relates_to found in event")
+            return None
+
+        # Handle m.in_reply_to (reply to specific message)
+        in_reply_to = relates_to.get("m.in_reply_to", {}) or {}
+        if in_reply_to:
+            event_id = in_reply_to.get("event_id")
+            logger.info(
+                "MatrixChannel: found m.in_reply_to event_id=%s",
+                event_id,
+            )
+            return event_id
+
+        # Handle thread root (m.thread with is_falling_back: true)
+        if relates_to.get("rel_type") == "m.thread":
+            event_id = relates_to.get("event_id")
+            logger.info(
+                "MatrixChannel: found m.thread event_id=%s",
+                event_id,
+            )
+            return event_id
+
+        logger.info("MatrixChannel: no reply relation found in m.relates_to")
+        return None
+
+    async def _fetch_event_content(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch event content from Matrix homeserver.
+
+        Returns the event content dict or None if fetch fails.
+        Includes media information for image/file events.
+        """
+        if not self._client:
+            return None
+        try:
+            # Matrix API: GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}
+            path = (
+                f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}"
+                f"/event/{urllib.parse.quote(event_id)}"
+            )
+            resp = await self._client.send("GET", path)
+            if hasattr(resp, "json"):
+                data = await resp.json()
+            else:
+                data = resp
+            # Extract body from various event types
+            content = data.get("content", {}) or {}
+            event_type = data.get("type", "")
+            msgtype = content.get("msgtype", "")
+            
+            result = {
+                "sender": data.get("sender", ""),
+                "body": content.get("body", ""),
+                "formatted_body": content.get("formatted_body", ""),
+                "msgtype": msgtype,
+                "event_type": event_type,
+                "event_id": data.get("event_id", event_id),
+            }
+            
+            # Include media information for image/file events
+            if msgtype in ("m.image", "m.file", "m.video", "m.audio"):
+                result["url"] = content.get("url", "")
+                result["info"] = content.get("info", {}) or {}
+                # For encrypted files
+                if msgtype == "m.file" and "file" in content:
+                    file_info = content.get("file", {})
+                    result["url"] = file_info.get("url", "")
+                    result["key"] = file_info.get("key", {})
+                    result["hashes"] = file_info.get("hashes", {})
+                    result["iv"] = file_info.get("iv", "")
+            
+            return result
+        except Exception as exc:
+            logger.debug(
+                "MatrixChannel: failed to fetch event %s: %s",
+                event_id,
+                exc,
+            )
+            return None
+
     async def _on_room_event(
         self,
         room: MatrixRoom,
@@ -2454,16 +2701,92 @@ class MatrixChannel(BaseChannel):
         # Build content parts, prepending accumulated history for group rooms.
         # Skip history prepend for slash commands — QwenPaw's command parser
         # requires the message to start with "/" to recognise it.
-        content_parts: list[Any] = [
-            TextContent(type=ContentType.TEXT, text=command_text),
-        ]
+        content_parts: list[Any] = []
         is_slash_cmd = command_text.startswith("/")
+
+        # Fetch and prepend replied message content if this is a reply
+        replied_event_id = self._extract_reply_to_event_id(event)
+        if replied_event_id:
+            replied_content = await self._fetch_event_content(
+                room_id,
+                replied_event_id,
+            )
+            if replied_content:
+                reply_sender = replied_content.get("sender", "")
+                reply_sender_name = self._get_display_name(room, reply_sender)
+                reply_body = replied_content.get("body", "")
+                reply_msgtype = replied_content.get("msgtype", "")
+                
+                # Add quoted context text
+                if reply_body:
+                    content_parts.append(
+                        TextContent(
+                            type=ContentType.TEXT,
+                            text=f"[Replying to {reply_sender_name}: {reply_body}]",
+                        ),
+                    )
+                
+                # If replied message is an image and vision is enabled, download it
+                if reply_msgtype == "m.image" and self.vision_enabled:
+                    replied_mxc_url = replied_content.get("url", "")
+                    replied_info = replied_content.get("info", {}) or {}
+                    replied_mimetype = replied_info.get("mimetype", "")
+                    replied_key = replied_content.get("key", {}) or {}
+                    replied_hashes = replied_content.get("hashes", {}) or {}
+                    replied_iv = replied_content.get("iv", "")
+                    
+                    if replied_mxc_url:
+                        # Generate filename for replied image
+                        replied_eid = replied_event_id[:8].lstrip("$")
+                        replied_filename = f"{replied_eid}_replied_image"
+                        
+                        # Add extension from mimetype
+                        if replied_mimetype and "." not in replied_filename:
+                            ext = mimetypes.guess_extension(replied_mimetype)
+                            if ext:
+                                replied_filename = f"{replied_filename}{ext}"
+                        
+                        # Download encrypted or unencrypted based on key presence
+                        if replied_key and replied_iv:
+                            replied_local_path = await self._download_encrypted_mxc(
+                                replied_mxc_url,
+                                replied_filename,
+                                replied_key,
+                                replied_hashes,
+                                replied_iv,
+                            )
+                        else:
+                            replied_local_path = await self._download_mxc(
+                                replied_mxc_url,
+                                replied_filename,
+                            )
+                        
+                        if replied_local_path:
+                            content_parts.append(
+                                ImageContent(
+                                    type=ContentType.IMAGE,
+                                    image_url=Path(replied_local_path).as_uri(),
+                                ),
+                            )
+                            logger.debug(
+                                "MatrixChannel: added replied image %s for event %s",
+                                replied_local_path,
+                                replied_event_id,
+                            )
+                
+                logger.debug(
+                    "MatrixChannel: prepended reply context for event %s",
+                    replied_event_id,
+                )
+
+        content_parts.append(TextContent(type=ContentType.TEXT, text=command_text))
+
         if not is_dm and not is_slash_cmd:
             # Prefix sender identity so the LLM can distinguish participants
             sender_name = self._get_display_name(room, sender_id)
             content_parts[0] = TextContent(
                 type=ContentType.TEXT,
-                text=f"{sender_name}: {command_text}",
+                text=f"{sender_name}: {content_parts[0].text}",
             )
             content_parts = self._apply_history_to_parts(
                 room_id,
@@ -2471,6 +2794,7 @@ class MatrixChannel(BaseChannel):
             )
 
         worker_name = (self._user_id or "").split(":")[0].lstrip("@")
+        replied_event_id_meta = self._extract_reply_to_event_id(event)
         payload = {
             "channel_id": CHANNEL_KEY,
             "sender_id": sender_id,
@@ -2483,6 +2807,7 @@ class MatrixChannel(BaseChannel):
                 "worker_name": worker_name,
                 "event_id": event.event_id,
                 "sender_id": sender_id,
+                "replied_to_event_id": replied_event_id_meta,
             },
         }
 
@@ -2544,16 +2869,120 @@ class MatrixChannel(BaseChannel):
 
         content_parts: list[Any] = []
 
+        # Fetch and prepend replied message content if this is a reply
+        replied_event_id = self._extract_reply_to_event_id(event)
+        if replied_event_id:
+            replied_content = await self._fetch_event_content(
+                room_id,
+                replied_event_id,
+            )
+            if replied_content:
+                reply_sender = replied_content.get("sender", "")
+                reply_sender_name = self._get_display_name(room, reply_sender)
+                reply_body = replied_content.get("body", "")
+                reply_msgtype = replied_content.get("msgtype", "")
+                
+                # Add quoted context text
+                if reply_body:
+                    content_parts.append(
+                        TextContent(
+                            type=ContentType.TEXT,
+                            text=f"[Replying to {reply_sender_name}: {reply_body}]",
+                        ),
+                    )
+                
+                # If replied message is an image and vision is enabled, download it
+                if reply_msgtype == "m.image" and self.vision_enabled:
+                    replied_mxc_url = replied_content.get("url", "")
+                    replied_info = replied_content.get("info", {}) or {}
+                    replied_mimetype = replied_info.get("mimetype", "")
+                    replied_size = replied_info.get("size", 0)
+                    
+                    if replied_mxc_url:
+                        # Generate filename for replied image
+                        replied_eid = replied_event_id[:8].lstrip("$")
+                        replied_filename = f"{replied_eid}_replied_image"
+                        
+                        # Add extension from mimetype
+                        if replied_mimetype and "." not in replied_filename:
+                            ext = mimetypes.guess_extension(replied_mimetype)
+                            if ext:
+                                replied_filename = f"{replied_filename}{ext}"
+                        
+                        replied_local_path = await self._download_mxc(
+                            replied_mxc_url,
+                            replied_filename,
+                        )
+                        if replied_local_path:
+                            content_parts.append(
+                                ImageContent(
+                                    type=ContentType.IMAGE,
+                                    image_url=Path(replied_local_path).as_uri(),
+                                ),
+                            )
+                            logger.debug(
+                                "MatrixChannel: added replied image %s for event %s",
+                                replied_local_path,
+                                replied_event_id,
+                            )
+                
+                logger.debug(
+                    "MatrixChannel: prepended reply context for media event %s",
+                    replied_event_id,
+                )
+
+        # Get event metadata for better context
+        event_info = getattr(event, "info", {}) or {}
+        mimetype = event_info.get("mimetype", "")
+        size = event_info.get("size", 0)
+
         if mxc_url:
-            # Use the body as filename, fall back to a safe default.
-            # Strip leading '$' from Matrix event IDs to avoid URI encoding
-            # issues ($→%24 breaks agentscope's image extension check).
+            # Generate clean filename: {event_id}_{type}.{ext}
+            # Use type-based name instead of body (caption) for cleaner filenames
             eid = event.event_id[:8].lstrip("$")
-            filename = body or f"matrix_media_{eid}"
-            filename = f"{eid}_{filename}"
+
+            # Determine file type prefix based on event type
+            if isinstance(event, RoomMessageImage):
+                type_prefix = "image"
+            elif isinstance(event, RoomMessageAudio):
+                type_prefix = "audio"
+            elif isinstance(event, RoomMessageVideo):
+                type_prefix = "video"
+            else:
+                type_prefix = "file"
+
+            # Start with type prefix, add extension from mimetype
+            filename = f"{eid}_{type_prefix}"
+
+            # Ensure file extension from MIME type for multimodal model compatibility
+            if mimetype and "." not in filename:
+                ext = mimetypes.guess_extension(mimetype)
+                if ext:
+                    filename = f"{filename}{ext}"
+                    logger.debug(
+                        "MatrixChannel: added extension %s from mimetype %s",
+                        ext,
+                        mimetype,
+                    )
+
             local_path = await self._download_mxc(mxc_url, filename)
             if local_path:
                 file_uri = Path(local_path).as_uri()
+
+                # Add metadata text with original body/caption
+                meta_text = f"[User sent {type_prefix}"
+                if body:
+                    meta_text += f': "{body}"'
+                meta_text += f" | id:{event.event_id}"
+                if mimetype:
+                    meta_text += f" | mime:{mimetype}"
+                if size:
+                    meta_text += f" | size:{size}"
+                meta_text += "]"
+                content_parts.append(
+                    TextContent(type=ContentType.TEXT, text=meta_text),
+                )
+
                 if isinstance(event, RoomMessageImage):
                     if self.vision_enabled:
                         content_parts.append(
@@ -2600,9 +3029,17 @@ class MatrixChannel(BaseChannel):
                 content_parts.append(
                     TextContent(
                         type=ContentType.TEXT,
-                        text=f"[Media unavailable: {body}]",
+                        text=f"[Media download failed: {body or type_prefix}]",
                     ),
                 )
+        else:
+            # No mxc_url, but still notify agent that media was sent
+            content_parts.append(
+                TextContent(
+                    type=ContentType.TEXT,
+                    text=f"[User sent a media message: {body or 'unnamed file'}]",
+                ),
+            )
 
         if not content_parts:
             return
@@ -2631,6 +3068,7 @@ class MatrixChannel(BaseChannel):
             )
 
         worker_name = (self._user_id or "").split(":")[0].lstrip("@")
+        replied_event_id_meta = self._extract_reply_to_event_id(event)
         payload = {
             "channel_id": CHANNEL_KEY,
             "sender_id": sender_id,
@@ -2643,6 +3081,7 @@ class MatrixChannel(BaseChannel):
                 "worker_name": worker_name,
                 "event_id": event.event_id,
                 "sender_id": sender_id,
+                "replied_to_event_id": replied_event_id_meta,
             },
         }
 
